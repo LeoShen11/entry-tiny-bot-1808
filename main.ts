@@ -2,8 +2,11 @@
 //
 // Strategy (written from the protocol schema, no kit code reused):
 //   Per symbol, track an EMA(6) / EMA(18) crossover on hourly closes plus a
-//   12-bar momentum filter. Hold a symbol only while its fast EMA sits above
-//   its slow EMA and its 12-bar return is positive; otherwise sit in USDC.
+//   12-bar momentum filter. Enter only on a confirmed uptrend (fast EMA
+//   above slow EMA and 12-bar return above +1%); once in, ride the trend
+//   until the fast EMA crosses back down, the 8% stop-loss trips, or the
+//   portfolio drawdown guard fires — exits ignore momentum so small wiggles
+//   do not churn the position in and out.
 //   Target weight is 20% of equity per symbol (cap is 25%), so at most ~7
 //   positions and never more than the account can fund. Exits are forced by
 //   a per-symbol stop-loss 8% below the entry cost and by a portfolio-level
@@ -22,7 +25,7 @@ import * as readline from "node:readline";
 const FAST_PERIOD = 6; // bars in the fast EMA
 const SLOW_PERIOD = 18; // bars in the slow EMA
 const MOMENTUM_BARS = 12; // bars in the momentum lookback
-const MOMENTUM_MIN = 0.003; // need +0.3% over the lookback to enter
+const MOMENTUM_MIN = 0.01; // need +1% over the lookback to enter
 const TARGET_WEIGHT = 0.2; // 20% of equity per held symbol
 const STOP_LOSS = 0.08; // exit a symbol 8% below its entry cost
 const MAX_DRAWDOWN = 0.15; // liquidate all if equity is 15% off its peak
@@ -108,6 +111,7 @@ interface SymState {
   closes: number[]; // plain prices (USDC per unit), oldest first
   emaFast: number | null;
   emaSlow: number | null;
+  holding: boolean; // true once entered, until the trend flips or stops out
 }
 
 const symbols = new Map<string, SymState>();
@@ -134,6 +138,11 @@ function decide(batch: BatchMsg): Order[] {
   const orders: Order[] = [];
   const equity = BigInt(batch.account.equity_quote_units);
   const cash = BigInt(batch.account.cash_quote_units);
+  // Cash left to spend on this bar's buys. The v1 bot sized every buy
+  // against the full cash balance, so several symbols buying on the same
+  // bar overspent it and 34 orders were rejected; the budget below is
+  // spent down as orders are issued, so the batch never over-commits.
+  let cashLeft = cash;
   if (equity > peakEquity) peakEquity = equity;
 
   // Portfolio-level drawdown guard: a 15% fall from the peak liquidates all.
@@ -162,19 +171,28 @@ function decide(batch: BatchMsg): Order[] {
         ? Number(pos.cost_quote_units) / 10 ** quoteScale / heldQty
         : null;
 
-    // Decide the target weight for this symbol on this bar.
-    let targetWeight = 0;
-    if (!inDrawdownGuard && st.closes.length >= WARMUP_BARS) {
-      const lookback = st.closes[st.closes.length - 1 - MOMENTUM_BARS];
-      const momentum =
-        lookback !== undefined && lookback > 0 ? (close - lookback) / lookback : -1;
-      const trendUp =
-        st.emaFast !== null && st.emaSlow !== null && st.emaFast > st.emaSlow;
-      const stopHit = entryPrice !== null && close < entryPrice * (1 - STOP_LOSS);
-      if (trendUp && momentum > MOMENTUM_MIN && !stopHit) {
-        targetWeight = TARGET_WEIGHT;
-      }
+    // Stateful trend riding: enter only on a confirmed uptrend (fast EMA
+    // above slow EMA and 12-bar momentum above +1%); once in, stay in until
+    // the trend flips, the stop-loss trips, or the drawdown guard fires.
+    // Re-deciding every bar on a small momentum wiggle churned the v1 bot
+    // (155 trades, 6% win rate, -472 USDC on the dev window), so the exit
+    // now ignores momentum entirely and only the entry requires it.
+    const lookback = st.closes[st.closes.length - 1 - MOMENTUM_BARS];
+    const momentum =
+      lookback !== undefined && lookback > 0 ? (close - lookback) / lookback : -1;
+    const trendUp =
+      st.emaFast !== null && st.emaSlow !== null && st.emaFast > st.emaSlow;
+    const stopHit = entryPrice !== null && close < entryPrice * (1 - STOP_LOSS);
+    if (inDrawdownGuard || stopHit || !trendUp) {
+      st.holding = false;
+    } else if (
+      !st.holding &&
+      st.closes.length >= WARMUP_BARS &&
+      momentum > MOMENTUM_MIN
+    ) {
+      st.holding = true;
     }
+    const targetWeight = st.holding ? TARGET_WEIGHT : 0;
 
     const equityUsdc = Number(equity) / 10 ** quoteScale;
     const targetValue = targetWeight * equityUsdc;
@@ -183,12 +201,13 @@ function decide(batch: BatchMsg): Order[] {
     const diff = cappedTarget - heldValue; // >0 buy, <0 sell
 
     if (diff > 0) {
-      // Buy only what the cash on hand can fund, and never below the
-      // minimum notional the harness accepts.
-      const cashUsdc = Number(cash) / 10 ** quoteScale;
+      // Buy only what the cash still unspent on this bar can fund, and
+      // never below the minimum notional the harness accepts.
+      const cashUsdc = Number(cashLeft) / 10 ** quoteScale;
       const buyUsdc = Math.min(diff, cashUsdc);
       const notional = toUnits(buyUsdc, quoteScale);
       if (notional >= minNotional && orders.length < maxOrdersPerBar) {
+        cashLeft -= notional;
         orderCounter += 1;
         orders.push({
           side: "buy",
@@ -247,6 +266,7 @@ async function main(): Promise<void> {
           closes: [],
           emaFast: null,
           emaSlow: null,
+          holding: false,
         });
       }
     } else if (msg.type === "batch") {
